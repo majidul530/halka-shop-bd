@@ -1,0 +1,187 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helpers ----------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdminDoc() {
+      // Looks up /admins/{uid}. Kept as a single doc get() to limit read cost.
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function adminRole() {
+      return get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role;
+    }
+
+    function isSuperAdmin() {
+      return isAdminDoc() && adminRole() == 'superadmin';
+    }
+
+    function hasAdminRole(roles) {
+      return isAdminDoc() && adminRole() in roles;
+    }
+
+    // ---------- users ----------
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdminDoc();
+      allow create: if isOwner(userId);
+      // Customers can update their own profile but never the "blocked" flag.
+      allow update: if isOwner(userId) &&
+        request.resource.data.blocked == resource.data.blocked
+        || hasAdminRole(['superadmin', 'support']);
+      allow delete: if false; // never hard-delete a user from client
+    }
+
+    // ---------- admins & roles ----------
+    match /admins/{uid} {
+      allow read: if isOwner(uid) || isAdminDoc();
+      // Only a superadmin can grant/change admin roles from the client.
+      // The very first superadmin must be created manually in the Firebase
+      // console (see README) since no signed-in superadmin exists yet.
+      allow write: if isSuperAdmin();
+    }
+
+    // ---------- products ----------
+    match /products/{productId} {
+      allow read: if resource.data.active == true || isAdminDoc();
+      allow create, update: if hasAdminRole(['superadmin', 'product_manager']);
+      allow delete: if hasAdminRole(['superadmin']);
+    }
+
+    // ---------- categories ----------
+    match /categories/{categoryId} {
+      allow read: if resource.data.active == true || isAdminDoc();
+      allow write: if hasAdminRole(['superadmin', 'product_manager']);
+    }
+
+    // ---------- banners ----------
+    match /banners/{bannerId} {
+      allow read: if resource.data.active == true || isAdminDoc();
+      allow write: if hasAdminRole(['superadmin']);
+    }
+
+    // ---------- carts (per-user, logged-in only) ----------
+    match /carts/{userId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    // ---------- wishlists ----------
+    match /wishlists/{userId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    // ---------- addresses (subcollection under users) ----------
+    match /users/{userId}/addresses/{addressId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    // ---------- orders ----------
+    // No Cloud Function to trust here, so validation happens in-rule:
+    // price/stock/coupon correctness is best-effort re-checked on the
+    // client immediately before this write (see orderService.js), and
+    // this rule blocks the most common tampering vectors.
+    match /orders/{orderId} {
+      allow read: if isOwner(resource.data.userId) || isAdminDoc();
+
+      allow create: if isSignedIn() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'Pending' &&
+        request.resource.data.paymentStatus in ['Pending', 'COD'] &&
+        request.resource.data.total is number &&
+        request.resource.data.total > 0;
+
+      // Customers can only cancel their own still-pending order.
+      allow update: if (isOwner(resource.data.userId) &&
+          resource.data.status == 'Pending' &&
+          request.resource.data.status == 'Cancelled' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        ) || hasAdminRole(['superadmin', 'order_manager']);
+
+      allow delete: if false;
+
+      match /items/{itemId} {
+        allow read: if isOwner(get(/databases/$(database)/documents/orders/$(orderId)).data.userId) || isAdminDoc();
+        allow create: if isSignedIn() &&
+          get(/databases/$(database)/documents/orders/$(orderId)).data.userId == request.auth.uid;
+        allow update, delete: if hasAdminRole(['superadmin', 'order_manager']);
+      }
+    }
+
+    // ---------- payments ----------
+    match /payments/{paymentId} {
+      allow read: if isOwner(resource.data.userId) || isAdminDoc();
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      // Only admin can flip status Pending -> Paid/Failed/Refunded.
+      allow update: if hasAdminRole(['superadmin', 'order_manager']);
+      allow delete: if false;
+    }
+
+    // ---------- coupons ----------
+    match /coupons/{couponId} {
+      // Public can read an active coupon by code to validate it at checkout,
+      // but cannot list all coupons (queries still need active==true).
+      allow read: if resource.data.active == true || isAdminDoc();
+      allow write: if hasAdminRole(['superadmin']);
+    }
+
+    match /couponUsage/{usageId} {
+      allow read: if isAdminDoc() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // ---------- reviews ----------
+    match /reviews/{reviewId} {
+      allow read: if resource.data.status == 'approved' || isAdminDoc() ||
+        (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'pending';
+      allow update: if hasAdminRole(['superadmin', 'support']);
+      allow delete: if hasAdminRole(['superadmin']);
+    }
+
+    // ---------- suppliers / supplierProducts (admin only, internal) ----------
+    match /suppliers/{supplierId} {
+      allow read, write: if hasAdminRole(['superadmin', 'product_manager']);
+    }
+    match /supplierProducts/{docId} {
+      allow read, write: if hasAdminRole(['superadmin', 'product_manager']);
+    }
+
+    // ---------- shippingMethods ----------
+    match /shippingMethods/{methodId} {
+      allow read: if true;
+      allow write: if hasAdminRole(['superadmin']);
+    }
+
+    // ---------- settings ----------
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if hasAdminRole(['superadmin']);
+    }
+
+    // ---------- notifications ----------
+    match /notifications/{notifId} {
+      allow read: if (isSignedIn() && resource.data.userId == request.auth.uid) || isAdminDoc();
+      allow create: if isSignedIn();
+      allow update: if isOwner(resource.data.userId) || isAdminDoc();
+      allow delete: if false;
+    }
+
+    // ---------- adminLogs ----------
+    match /adminLogs/{logId} {
+      allow read: if isAdminDoc();
+      allow create: if isAdminDoc();
+      allow update, delete: if false;
+    }
+  }
+}

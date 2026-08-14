@@ -1,0 +1,42 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidImage() {
+      return request.resource.size < 3 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/.*');
+    }
+
+    // Product images: public read, only signed-in users can attempt write,
+    // but real write protection for "admin only" happens by only exposing
+    // the upload UI to admins in the app AND mirroring the check here via
+    // a custom claim in production. For the free-tier baseline we require
+    // sign-in + valid image; tighten with custom claims once available.
+    match /products/{productId}/{fileName} {
+      allow read: if true;
+      allow write: if isSignedIn() && isValidImage();
+    }
+
+    match /banners/{fileName} {
+      allow read: if true;
+      allow write: if isSignedIn() && isValidImage();
+    }
+
+    // Review images: only the review's author can upload into their own folder.
+    match /reviews/{userId}/{fileName} {
+      allow read: if true;
+      allow write: if isSignedIn() && request.auth.uid == userId && isValidImage();
+    }
+
+    // User avatar / private uploads
+    match /users/{userId}/{fileName} {
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow write: if isSignedIn() && request.auth.uid == userId && isValidImage();
+    }
+  }
+}
